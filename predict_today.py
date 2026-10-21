@@ -30,7 +30,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, log_loss, classification_report
-
+import argparse
+from datetime import date
 warnings.filterwarnings("ignore")
 
 CACHE_DIR = "data_cache"
@@ -72,7 +73,7 @@ ELO_HOME_BONUS = 60
 
 # palette (matches your existing reel charts)
 INK, MUTE, GRID = "#1a1a2e", "#8a8a9e", "#e8e8ee"
-ORANGE, BLUE, GRAY = "#ff6b18", "#1f6feb", "#9aa0a6"
+GREEN, BLUE, GRAY = "#18ff37", "#1f6feb", "#9aa0a6"
 plt.rcParams.update({
     "figure.facecolor": "white", "axes.facecolor": "white",
     "axes.edgecolor": MUTE, "axes.labelcolor": INK, "text.color": INK,
@@ -109,6 +110,33 @@ def load_results():
     r["neutral"] = r["neutral"].astype(str).str.upper().eq("TRUE").astype(int)
     return r.sort_values("date").reset_index(drop=True)
 
+def load_shootout_rates(k=4):
+    # """Returns {team: win_rate} from data_cache/penalty_shootouts.csv, or {} if missing."""
+    # path = os.path.join(CACHE_DIR, "penalty_shootouts.csv")
+    # if not os.path.exists(path):
+    #     return {}
+    # df = pd.read_csv(path)
+    # df = df[df["shootouts_played"] > 0].copy()
+    # df["rate"] = df["shootouts_won"] / df["shootouts_played"]
+    # return dict(zip(df["team"], df["rate"]))
+    """
+    Returns {team: shrunk_win_rate} from data_cache/penalty_shootouts.csv,
+    or {} if the file doesn't exist yet.
+
+    Uses shrinkage toward a 50% prior so teams with only 1-2 career shootouts
+    aren't treated as if their small-sample rate (e.g. 100% off one win) is a
+    reliable skill estimate. k controls the strength of the pull toward 50%:
+    it's the number of "imaginary" 50/50 shootouts added to every team's
+    record before computing the rate. Higher k = more skepticism of small
+    samples. k=4 means a team needs several real shootouts before its raw
+    rate meaningfully outweighs the neutral prior.
+    """
+    path = os.path.join(CACHE_DIR, "penalty_shootouts.csv")
+    if not os.path.exists(path):
+        return {}
+    df = pd.read_csv(path)
+    df["shrunk_rate"] = (df["shootouts_won"] + k * 0.5) / (df["shootouts_played"] + k)
+    return dict(zip(df["team"], df["shrunk_rate"]))
 
 # ── feature engineering ─────────────────────────────────────────────────────────
 def tournament_weight(name):
@@ -274,6 +302,25 @@ def predict_symmetric(model, long, final_elo, a, b, asof, neutral, weight):
     tot = p_a + p_d + p_b
     return p_a / tot, p_d / tot, p_b / tot
 
+def resolve_draw(p_home, p_draw, p_away, home_elo, away_elo, shootout_rates=None, home=None, away=None):
+    """
+    Knockout matches can't end level — extra time then penalties always produce
+    a winner — so this folds the 90-minute draw probability into win/loss.
+    If shootout_rates is supplied (team -> historical shootout win rate), the
+    draw slice is split using each team's penalty-shootout record. Otherwise it
+    falls back to splitting by relative Elo strength, which is a reasonable
+    default: research on shootouts suggests they're close to a coin flip, but
+    the stronger side still gets slightly more extra-time chances to win it
+    before it even reaches penalties.
+    """
+    if shootout_rates and home in shootout_rates and away in shootout_rates:
+        h_rate, a_rate = shootout_rates[home], shootout_rates[away]
+        total = h_rate + a_rate
+        home_share = h_rate / total if total > 0 else 0.5
+    else:
+        home_share = 1 / (1 + 10 ** (-(home_elo - away_elo) / 400))
+    return p_home + p_draw * home_share, p_away + p_draw * (1 - home_share)
+
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 def map_fixture_name(name):
@@ -321,7 +368,7 @@ def make_chart(m, p_home, p_draw, p_away, slate_date, out_dir):
     fig, ax = plt.subplots(figsize=(8, 4.8))
     labels = [f"{m['home_disp']}\nwin", "Draw", f"{m['away_disp']}\nwin"]
     vals = [p_home, p_draw, p_away]
-    colors = [ORANGE, GRAY, BLUE]
+    colors = [GREEN, GRAY, BLUE]
     bars = ax.bar(labels, [v * 100 for v in vals], color=colors, width=0.62, zorder=3)
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v * 100 + 1.2, f"{v*100:.1f}%",
@@ -352,20 +399,54 @@ def tag_match(top_prob, p_home, p_away, home_elo, away_elo):
         strength = "TOSS-UP"
     return strength + ("  ⚠️ UPSET PICK" if upset else "")
 
+def freeform_match(team_a, team_b, valid_teams, round_name="Knockout", stadium="", match_date=None):
+    """Build a match dict for a game that isn't in fixtures.csv (e.g. an unresolved
+    knockout fixture), so we can still predict it."""
+    def resolve(name):
+        if name in valid_teams:
+            return name
+        for t in valid_teams:
+            if t.lower() == name.strip().lower():
+                return t
+        return name  # let it fail downstream with a clear error if truly unknown
+
+    home, away = resolve(team_a), resolve(team_b)
+    match_date = match_date or date.today().isoformat()
+    return {
+        "match": "", "group": round_name, "stadium": stadium or "TBD",
+        "date": match_date, "home_disp": home, "away_disp": away,
+        "home": home, "away": away,
+    }
+
 
 # ── main ────────────────────────────────────────────────────────────────────────
 def get_teams_from_args():
-    """Two team names from the command line, or ask for them interactively."""
-    if len(sys.argv) >= 3:
-        return sys.argv[1], sys.argv[2]
+    # """Two team names from the command line, or ask for them interactively."""
+    # if len(sys.argv) >= 3:
+    #     return sys.argv[1], sys.argv[2]
+    # print("Enter the two teams to predict (e.g. Saudi Arabia / Uruguay).")
+    # a = input("  Team 1: ").strip()
+    # b = input("  Team 2: ").strip()
+    # return a, b
+    parser = argparse.ArgumentParser()
+    parser.add_argument("team_a")
+    parser.add_argument("team_b")
+    parser.add_argument("--date", help="Match date YYYY-MM-DD (default: today)")
+    parser.add_argument("--round", default="Knockout", help="e.g. 'Round of 16', 'Quarterfinal'")
+    parser.add_argument("--stadium", default="")
+    parser.add_argument("--not-neutral", action="store_true", help="Match is NOT on neutral ground")
+    if len(sys.argv) >= 3 and not sys.argv[1].startswith("-"):
+        args = parser.parse_args()
+        return args
     print("Enter the two teams to predict (e.g. Saudi Arabia / Uruguay).")
     a = input("  Team 1: ").strip()
     b = input("  Team 2: ").strip()
-    return a, b
-
+    return argparse.Namespace(team_a=a, team_b=b, date=None, round="Knockout",
+                               stadium="", not_neutral=False)
 
 def main():
-    team_a, team_b = get_teams_from_args()
+    args = get_teams_from_args()
+    team_a, team_b = args.team_a, args.team_b
 
     print("\nLoading data + building features ...")
     results = load_results()
@@ -375,10 +456,17 @@ def main():
 
     m = find_fixture(team_a, team_b)
     if m is None:
-        print(f"\n  Couldn't find a World Cup match between '{team_a}' and '{team_b}'.")
-        print("  Check spelling. Teams in the tournament:")
-        print("   " + ", ".join(list_team_names()))
-        return
+        # print(f"\n  Couldn't find a World Cup match between '{team_a}' and '{team_b}'.")
+        # print("  Check spelling. Teams in the tournament:")
+        # print("   " + ", ".join(list_team_names()))
+        # return
+        print(f"\n  '{team_a}' vs '{team_b}' isn't in fixtures.csv (likely a knockout match "
+          f"not present at scrape time). Predicting it directly instead.\n")
+        m = freeform_match(team_a, team_b, valid_teams, args.round, args.stadium, args.date)
+        neutral = not args.not_neutral
+    else:
+        neutral = MATCH_NEUTRAL
+
     if m["home"] not in valid_teams or m["away"] not in valid_teams:
         print(f"\n  That match isn't predictable yet (a team is still a placeholder, e.g. a knockout slot).")
         return
@@ -389,11 +477,17 @@ def main():
     model, X_val, y_val = train_model(train, val)
 
     p_home, p_draw, p_away = predict_symmetric(
-        model, long, final_elo, m["home"], m["away"], match_date, MATCH_NEUTRAL, MATCH_WEIGHT)
+        model, long, final_elo, m["home"], m["away"], match_date, neutral, MATCH_WEIGHT)
     outcomes = [(m["home_disp"], p_home), ("Draw", p_draw), (m["away_disp"], p_away)]
     pick, conf = max(outcomes, key=lambda x: x[1])
     he, ae = final_elo.get(m["home"], ELO_BASE), final_elo.get(m["away"], ELO_BASE)
     tag = tag_match(conf, p_home, p_away, he, ae)
+
+    shootout_rates = load_shootout_rates()
+    is_knockout = not str(m["group"]).strip().lower().startswith("group")
+    if is_knockout:
+        p_home, p_away = resolve_draw(p_home, p_draw, p_away, he, ae, shootout_rates, m["home"], m["away"])
+        p_draw = 0.0
 
     out_dir = os.path.join("predictions", str(match_date))
     os.makedirs(out_dir, exist_ok=True)
